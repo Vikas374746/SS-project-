@@ -886,83 +886,227 @@ class MicrophoneSignalCapture:
             return f"Audio processing error: {str(e)}"
 
 class SignalClassifier:
-    """Classify signals based on their characteristics"""
-    
+    """Enhanced signal classifier with symmetry, nature, and energy analysis"""
+
+    @staticmethod
+    def check_symmetry(x):
+        """Check if signal is even, odd, or neither"""
+        # Create reversed signal for comparison
+        x_rev = x[::-1]
+        # Check even symmetry: x[n] = x[-n]
+        even_error = np.mean(np.abs(x - x_rev))
+        # Check odd symmetry: x[n] = -x[-n]
+        odd_error = np.mean(np.abs(x + x_rev))
+        # Use threshold for numerical stability
+        threshold = 1e-10 * np.max(np.abs(x))
+        
+        if even_error < threshold:
+            return "Even"
+        elif odd_error < threshold:
+            return "Odd"
+        return "Neither"
+
+    @staticmethod
+    def check_deterministic(x, t_or_n):
+        """Check if signal appears deterministic or random"""
+        # Compute signal differences and their statistics
+        diff = np.diff(x)
+        std_ratio = np.std(diff) / (np.std(x) + 1e-12)
+        
+        # Check for patterns in the signal
+        fft_x = np.abs(fft(x))
+        peak_ratio = np.max(fft_x) / np.mean(fft_x)
+        
+        # Analyze local predictability
+        predictability = 1.0 - (std_ratio / (1 + peak_ratio))
+        
+        return "Deterministic" if predictability > 0.7 else "Random"
+
+    @staticmethod
+    def analyze_energy_power(x, t_or_n, is_discrete):
+        """Classify signal as energy or power signal"""
+        if is_discrete:
+            energy = np.sum(np.abs(x)**2)
+            power = energy / len(x)  # Average power
+        else:
+            dt = t_or_n[1] - t_or_n[0]
+            energy = np.sum(np.abs(x)**2) * dt
+            power = energy / (t_or_n[-1] - t_or_n[0])
+        
+        # Classification logic
+        if energy < 1e6:  # Finite energy threshold
+            return "Energy Signal"
+        elif 0.01 < power < 1e6:  # Reasonable power range
+            return "Power Signal"
+        return "Undefined"
+
+    @staticmethod
+    def detect_elementary_signal(x, t_or_n):
+        """Identify basic signal types"""
+        # Normalize signal for consistent detection
+        x_norm = (x - np.mean(x)) / (np.std(x) + 1e-12)
+        
+        # Check for sudden jump (unit step)
+        if np.any(np.abs(np.diff(x_norm)) > 3.0) and len(np.where(np.abs(np.diff(x_norm)) > 1.0)[0]) < 3:
+            return "Unit Step"
+        
+        # Check for linear growth (ramp)
+        diff1 = np.diff(x)
+        if np.std(np.diff(diff1)) / (np.std(diff1) + 1e-12) < 0.1:
+            return "Ramp"
+        
+        # Check for impulse
+        if np.max(np.abs(x_norm)) > 5.0 and np.sum(np.abs(x_norm) > 2.0) < len(x_norm) * 0.1:
+            return "Impulse"
+        
+        # Check for sinusoidal
+        fft_x = np.abs(fft(x_norm))
+        if np.max(fft_x[1:]) / np.mean(fft_x[1:]) > 10:
+            return "Sinusoidal"
+        
+        # Check for exponential
+        log_x = np.log(np.abs(x - np.min(x) + 1e-12))
+        if np.std(np.diff(log_x)) / (np.std(log_x) + 1e-12) < 0.2:
+            return "Exponential"
+        
+        return "Complex/Other"
+
     @staticmethod
     def extract_features(t_or_n, x, is_discrete=False):
-        """Extract features for classification"""
         features = {}
+        # Store signal for length calculations
+        features['signal'] = x
         
-        # Time/Statistical domain features
-        features['mean'] = np.mean(x)
-        features['std'] = np.std(x)
-        features['rms'] = np.sqrt(np.mean(x**2))
-        features['peak'] = np.max(np.abs(x))
-        features['peak_to_peak'] = np.ptp(x)
-        features['skewness'] = pd.Series(x).skew()
-        features['kurtosis'] = pd.Series(x).kurtosis()
-        features['zero_crossings'] = len(np.where(np.diff(np.sign(x)))[0])
+        # Basic statistics with improved robustness
+        features['mean'] = float(np.mean(x))
+        features['std'] = float(np.std(x))
+        features['rms'] = float(np.sqrt(np.mean(np.square(x))))
+        features['max'] = float(np.max(x))
+        features['min'] = float(np.min(x))
         
-        # Frequency domain features (if not discrete or has enough samples)
-        if len(x) > 10:
-            X = fft(x)
-            freqs = fftfreq(len(x), 1.0 if is_discrete else (t_or_n[1] - t_or_n[0]))
-            psd = np.abs(X)**2
-            
-            # Find dominant frequency
-            dominant_idx = np.argmax(psd[:len(psd)//2])
-            features['dominant_freq'] = np.abs(freqs[dominant_idx])
-            features['spectral_energy'] = np.sum(psd)
-            features['spectral_centroid'] = np.sum(freqs[:len(freqs)//2] * psd[:len(psd)//2]) / np.sum(psd[:len(psd)//2])
-            
-            # Calculate spectral flatness (Wiener entropy)
-            if np.all(psd[:len(psd)//2] > 0):
-                geometric_mean = np.exp(np.mean(np.log(psd[:len(psd)//2])))
-                arithmetic_mean = np.mean(psd[:len(psd)//2])
-                features['spectral_flatness'] = geometric_mean / arithmetic_mean if arithmetic_mean > 0 else 0
-            else:
-                features['spectral_flatness'] = 0
-                
-            # Calculate spectral roll-off (frequency below which 85% of spectral energy is contained)
-            cumsum = np.cumsum(psd[:len(psd)//2])
-            rolloff_point = 0.85 * cumsum[-1]
-            rolloff_idx = np.where(cumsum >= rolloff_point)[0][0]
-            features['spectral_rolloff'] = np.abs(freqs[rolloff_idx])
-            
-            # Calculate spectral bandwidth
-            features['spectral_bandwidth'] = np.sqrt(np.sum(((freqs[:len(freqs)//2] - features['spectral_centroid'])**2) * 
-                                                    psd[:len(psd)//2]) / np.sum(psd[:len(psd)//2]))
+        # Normalized statistics for better comparison
+        if np.std(x) != 0:
+            features['skew'] = float(np.mean((x - np.mean(x)) ** 3) / (np.std(x) ** 3))
+            features['kurtosis'] = float(np.mean((x - np.mean(x)) ** 4) / (np.std(x) ** 4))
+        else:
+            features['skew'] = 0.0
+            features['kurtosis'] = 0.0
+        
+        # Zero crossings with improved accuracy
+        zero_crossings = np.where(np.diff(np.signbit(x)))[0]
+        features['zero_crossings'] = len(zero_crossings)
+        
+        # Zero crossing regularity (important for periodic signals)
+        if len(zero_crossings) > 1:
+            zero_crossing_intervals = np.diff(zero_crossings)
+            features['zero_crossing_regularity'] = np.std(zero_crossing_intervals) / np.mean(zero_crossing_intervals)
+        else:
+            features['zero_crossing_regularity'] = float('inf')
+        
+        # Peak analysis
+        features['peak_to_peak'] = float(np.max(x) - np.min(x))
+        
+        # Spectral analysis
+        X = np.abs(fft(x))
+        # Normalize FFT by signal length for consistent comparison
+        X = X / len(x)
+        
+        # Improved spectral flatness calculation
+        log_spectrum = np.log(X + 1e-12)
+        features['spectral_flatness'] = float(np.exp(np.mean(log_spectrum)) / (np.mean(X) + 1e-12))
+        
+        # Peak frequency analysis
+        freqs = fftfreq(len(x), 1.0 if is_discrete else (t_or_n[1] - t_or_n[0]))
+        main_freq_idx = np.argmax(X[1:len(X)//2]) + 1  # Skip DC component
+        features['main_freq'] = float(abs(freqs[main_freq_idx]))
+        
+        # Harmonic analysis
+        harmonics = X[1:len(X)//2]
+        sorted_harmonics = np.sort(harmonics)[::-1]
+        features['harmonic_ratio'] = float(sorted_harmonics[0] / (np.mean(sorted_harmonics[1:10]) + 1e-12))
+        
+        # Advanced classification features
+        features['symmetry'] = SignalClassifier.check_symmetry(x)
+        features['nature'] = SignalClassifier.check_deterministic(x, t_or_n)
+        features['energy_power'] = SignalClassifier.analyze_energy_power(x, t_or_n, is_discrete)
+        features['elementary_type'] = SignalClassifier.detect_elementary_signal(x, t_or_n)
         
         return features
-    
+
     @staticmethod
     def classify_signal_type(features):
-        """Enhanced rule-based classification"""
-        # Enhanced heuristic classification
-        if features['zero_crossings'] == 0:
-            if features['std'] < 0.1:
-                return "DC/Constant"
+        """Enhanced signal classification with improved accuracy and detailed characteristics"""
+        signal_types = []
+        
+        # Normalize key features for robust classification
+        signal_length = len(features['signal']) if 'signal' in features else 1
+        zero_crossings_per_length = features['zero_crossings'] / signal_length
+        peak_to_rms = features['peak_to_peak'] / (features['rms'] + 1e-6)
+        
+        # 1. Primary Signal Type Detection
+        if features['zero_crossings'] == 0 and features['std'] < 0.05:
+            signal_types.append("DC/Constant")
+            
+        elif (0.3 < zero_crossings_per_length < 0.7 and
+              1.5 < peak_to_rms < 3.5 and
+              abs(features['skew']) < 0.3 and
+              abs(features['kurtosis'] - 1.5) < 1.0):
+            if features['harmonic_ratio'] > 10:  # Strong fundamental frequency
+                signal_types.append(f"Sinusoidal (f≈{features['main_freq']:.2f}Hz)")
             else:
-                return "Step/Ramp"
-        elif features['zero_crossings'] < 5:
-            if 'spectral_flatness' in features and features['spectral_flatness'] < 0.1:
-                return "Exponential Decay"
-            else:
-                return "Low Frequency"
-        elif 'dominant_freq' in features and features['dominant_freq'] > 0:
-            if 'spectral_flatness' in features and features['spectral_flatness'] > 0.5:
-                return "Noise/Random"
-            elif features['peak_to_peak'] > 1.8 * features['rms']:
-                if features['kurtosis'] > 0:
-                    return "Square Wave"
-                else:
-                    return "Pulse/Sawtooth"
-            elif 0.8 < features['kurtosis'] < 2.0 and features['skewness'] < 0.2:
-                return "Sinusoidal"
-            else:
-                return "Triangle/Modulated"
+                signal_types.append("Complex Periodic")
+                
+        elif (features['zero_crossings'] <= 2 and 
+              features['std'] > 0.1 and 
+              features['kurtosis'] > 3.0):
+            signal_types.append("Step")
+            
+        elif (features['zero_crossings'] < 3 and 
+              abs(features['skew']) > 0.5 and 
+              features['spectral_flatness'] < 0.1):
+            signal_types.append("Ramp")
+            
+        elif (peak_to_rms > 3.5 and 
+              features['kurtosis'] > 2.5 and 
+              features['spectral_flatness'] < 0.3):
+            signal_types.append("Square Wave")
+            
+        elif (0.2 < zero_crossings_per_length < 0.4 and 
+              1.5 < peak_to_rms < 4.0 and 
+              abs(features['skew']) > 0.2):
+            signal_types.append("Sawtooth/Triangle")
+            
+        elif features['spectral_flatness'] > 0.7:
+            signal_types.append("Random/Noise")
+            
         else:
-            return "Complex/Noise"
+            signal_types.append("Complex")
+        
+        # 2. Symmetry Classification
+        if abs(features['skew']) < 0.1:
+            signal_types.append("Even Symmetric")
+        elif abs(features['kurtosis']) < 0.1:
+            signal_types.append("Odd Symmetric")
+        else:
+            signal_types.append("Non-symmetric")
+        
+        # 3. Signal Nature Classification
+        if features['zero_crossing_regularity'] < 0.1 and features['harmonic_ratio'] > 5:
+            signal_types.append("Deterministic")
+        elif features['spectral_flatness'] > 0.6:
+            signal_types.append("Random")
+        else:
+            signal_types.append("Mixed")
+        
+        # 4. Energy/Power Classification
+        energy_power = features['energy_power']
+        if isinstance(energy_power, str):
+            signal_types.append(energy_power.capitalize())
+        
+        return signal_types
+            
+        # Default case
+        return "Other"
 
 # =============================================================================
 # MAIN APPLICATION
@@ -2322,38 +2466,230 @@ def show_signal_properties(t_or_n, x, domain):
     st.plotly_chart(fig, use_container_width=True)
 
 def show_classification(t_or_n, x, domain, actual_type):
-    st.markdown("## 🤖 Signal Classification")
+    st.markdown("## 🤖 Enhanced Signal Classification")
     
     # Extract features and classify
     is_discrete = (domain == "Discrete-Time")
     features = SignalClassifier.extract_features(t_or_n, x, is_discrete)
     predicted_type = SignalClassifier.classify_signal_type(features)
     
-    # Calculate additional metrics
+    # Calculate core metrics
     fs = 1000  # Assume 1kHz sampling rate if not provided
     if len(t_or_n) > 1:
         fs = 1.0 / (t_or_n[1] - t_or_n[0]) if not is_discrete else 1.0
     
-    # Calculate harmonic distortion if signal is long enough
-    thd_info = None
-    if len(x) > 50:
-        thd_info = SignalProcessor.calculate_harmonic_distortion(x, fs)
-    
-    # Calculate SNR (assuming signal is mostly clean)
+    # Advanced signal analysis
+    thd_info = SignalProcessor.calculate_harmonic_distortion(x, fs) if len(x) > 50 else None
     snr = SignalProcessor.calculate_snr(x)
     
-    # Display results
-    col1, col2 = st.columns(2)
+    # Create modern dashboard layout
+    col1, col2 = st.columns([3, 2])
     
     with col1:
-        st.markdown("### Classification Results")
-        st.markdown(f'<div class="signal-card">', unsafe_allow_html=True)
-        st.write(f"**Actual Signal Type:** {actual_type.title()}")
-        st.write(f"**Predicted Type:** {predicted_type}")
+        # Signal Identity Card
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%); 
+                    padding: 1.5rem; border-radius: 10px; color: white; margin-bottom: 1rem;">
+            <h3 style="color: white; margin: 0;">📊 Signal Identity Card</h3>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # Simple accuracy check
-        accuracy_indicator = "✅" if actual_type.lower() in predicted_type.lower() or predicted_type.lower() in actual_type.lower() else "❌"
+        # Main classification card
+        st.markdown(f'<div class="signal-card" style="padding: 1.5rem; border-radius: 10px;">', unsafe_allow_html=True)
+        
+        # Basic Info
+        if isinstance(actual_type, str):
+            actual_type = [actual_type]  # Convert string to list for consistency
+        if isinstance(predicted_type, str):
+            predicted_type = [predicted_type]  # Convert string to list for consistency
+            
+        # Display actual type
+        st.write("**🎯 Actual Type:**", ", ".join(t.title() for t in actual_type))
+        
+        # Display predicted types with categorization
+        st.write("**🎯 Predicted Classifications:**")
+        categories = {
+            "Signal Type": lambda x: not any(k in x.lower() for k in ["symmetric", "random", "deterministic", "mixed", "energy", "power"]),
+            "Symmetry": lambda x: "symmetric" in x.lower(),
+            "Nature": lambda x: any(k in x.lower() for k in ["random", "deterministic", "mixed"]),
+            "Energy/Power": lambda x: any(k in x.lower() for k in ["energy", "power"])
+        }
+        
+        for category, filter_func in categories.items():
+            matching_types = [t for t in predicted_type if filter_func(t)]
+            if matching_types:
+                st.write(f"  • {category}: {', '.join(matching_types)}")
+        
+        # Match indicator - check if any predicted type matches any actual type
+        any_match = any(
+            any(p.lower() in a.lower() or a.lower() in p.lower() 
+                for a in actual_type)
+            for p in predicted_type
+        )
+        match_status = "✅" if any_match else "❌"
+        st.write("**🎯 Classification Match:**", match_status)
+        
+        # Symmetry Analysis - look for symmetry in predicted types
+        symmetry_type = next((t for t in predicted_type if "symmetric" in t.lower()), "Unknown")
+        symmetry_color = {
+            "Even Symmetric": "🟢",
+            "Odd Symmetric": "🟡",
+            "Non-symmetric": "⚪"
+        }.get(symmetry_type, "⚪")
+        st.write(f"**🔄 Symmetry Type:** {symmetry_color} {features['symmetry']}")
+        
+        # Nature Analysis
+        nature_color = "🟢" if features['nature'] == "Deterministic" else "🟡"
+        st.write(f"**🎲 Signal Nature:** {nature_color} {features['nature']}")
+        
+        # Energy/Power Analysis
+        energy_color = {
+            "Energy Signal": "🟢",
+            "Power Signal": "🟡",
+            "Undefined": "⚪"
+        }.get(features['energy_power'], "⚪")
+        st.write(f"**⚡ Signal Class:** {energy_color} {features['energy_power']}")
+        
+        # Elementary Signal Detection
+        elementary_color = "🟢" if features['elementary_type'] != "Complex/Other" else "⚪"
+        st.write(f"**📐 Elementary Form:** {elementary_color} {features['elementary_type']}")
+        
+        # Detailed Analysis Expander
+        with st.expander("📈 Detailed Analysis"):
+            # Symmetry metrics
+            st.markdown("#### Symmetry Analysis")
+            x_rev = x[::-1]
+            even_error = np.mean(np.abs(x - x_rev))
+            odd_error = np.mean(np.abs(x + x_rev))
+            st.write(f"Even Symmetry Error: {even_error:.6f}")
+            st.write(f"Odd Symmetry Error: {odd_error:.6f}")
+            
+            # Deterministic analysis
+            st.markdown("#### Deterministic vs Random")
+            fft_x = np.abs(fft(x))
+            peak_ratio = np.max(fft_x) / np.mean(fft_x)
+            st.write(f"Predictability Score: {1.0 - (np.std(np.diff(x))/(np.std(x) + 1e-12)):.3f}")
+            st.write(f"Spectral Peak Ratio: {peak_ratio:.3f}")
+            
+            # Energy and Power
+            st.markdown("#### Energy & Power Metrics")
+            if is_discrete:
+                energy = np.sum(np.abs(x)**2)
+                power = energy / len(x)
+            else:
+                dt = t_or_n[1] - t_or_n[0]
+                energy = np.sum(np.abs(x)**2) * dt
+                power = energy / (t_or_n[-1] - t_or_n[0])
+            st.write(f"Total Energy: {energy:.3f}")
+            st.write(f"Average Power: {power:.3f}")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    with col2:
+        # Visualization Summary
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #134e5e 0%, #71b280 100%); 
+                    padding: 1.5rem; border-radius: 10px; color: white; margin-bottom: 1rem;">
+            <h3 style="color: white; margin: 0;">🎨 Visual Analysis</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Signal Characteristics Plot
+        fig = go.Figure()
+        
+        # Plot original signal
+        fig.add_trace(go.Scatter(
+            x=t_or_n,
+            y=x,
+            name='Signal',
+            line=dict(color='#00ff00', width=2)
+        ))
+        
+        # Plot reversed signal for symmetry comparison
+        fig.add_trace(go.Scatter(
+            x=t_or_n,
+            y=x[::-1],
+            name='Reversed',
+            line=dict(color='#ff0000', width=2, dash='dash')
+        ))
+        
+        # Layout
+        fig.update_layout(
+            title="Signal Symmetry Visualization",
+            height=300,
+            margin=dict(l=20, r=20, t=40, b=20),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0.1)',
+            showlegend=True
+        )
+        
+        # Configure axes
+        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)', title_text="Time/Sample")
+        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)', title_text="Amplitude")
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Classification Metrics
+        st.markdown(f'<div class="signal-card">', unsafe_allow_html=True)
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            st.metric(
+                "Signal Quality",
+                f"{snr:.1f} dB",
+                delta="Good" if snr > 20 else ("Fair" if snr > 10 else "Poor")
+            )
+            st.metric(
+                "Spectral Purity",
+                f"{features['spectral_flatness']:.3f}",
+                delta="Clean" if features['spectral_flatness'] < 0.3 else "Noisy"
+            )
+        
+        with col4:
+            if thd_info:
+                st.metric(
+                    "Harmonic Distortion",
+                    f"{thd_info['thd']:.3%}",
+                    delta="Low" if thd_info['thd'] < 0.1 else "High"
+                )
+                st.metric(
+                    "Fundamental Freq",
+                    f"{thd_info['fundamental_freq']:.1f} Hz"
+                )
+            
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Display predicted types by category
+        st.write("**Predicted Classifications:**")
+        categories = {
+            "Basic Type": lambda x: not any(k in x.lower() for k in ["symmetric", "random", "deterministic", "mixed", "energy", "power"]),
+            "Symmetry": lambda x: "symmetric" in x.lower(),
+            "Nature": lambda x: any(k in x.lower() for k in ["random", "deterministic", "mixed"]),
+            "Energy/Power": lambda x: any(k in x.lower() for k in ["energy", "power"])
+        }
+        
+        for category, filter_func in categories.items():
+            matching_types = [t for t in predicted_type if filter_func(t)]
+            if matching_types:
+                st.write(f"  • {category}: {', '.join(matching_types)}")
+        
+        # Enhanced accuracy check
+        if isinstance(actual_type, str):
+            actual_type = [actual_type]
+            
+        matches = []
+        for pred in predicted_type:
+            for actual in actual_type:
+                if (pred.lower() in actual.lower() or 
+                    actual.lower() in pred.lower()):
+                    matches.append(pred)
+                    break
+        
+        accuracy_indicator = "✅" if matches else "❌"
         st.write(f"**Classification Match:** {accuracy_indicator}")
+        if matches:
+            st.write("**Matching Types:**", ", ".join(matches))
+            
         st.markdown('</div>', unsafe_allow_html=True)
     
     with col2:
