@@ -1,0 +1,13 @@
+# Core
+streamlit==1.38.0
+numpy==2.1.1
+pandas==2.2.2
+plotly==5.24.1
+scipy==1.14.1
+scikit-learn==1.5.1
+matplotlib==3.9.2
+
+# Optional features used in the app
+pyaudio==0.2.14            # microphone capture (Windows needs prebuilt wheel)
+SpeechRecognition==3.10.4  # speech-to-text
+librosa==0.10.2.post1      # spectrograms and audio features
